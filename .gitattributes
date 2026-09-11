@@ -1,0 +1,11 @@
+# Normalise line endings to LF in the repo; check out as LF everywhere.
+# Without this, core.autocrlf=true (set in Git for Windows' system gitconfig)
+# gives fresh clones and new worktrees CRLF working-tree copies.
+* text=auto eol=lf
+
+# Rust: force text, and use git's built-in Rust hunk headers in diffs.
+*.rs text eol=lf diff=rust
+Cargo.toml text eol=lf
+# Cargo.lock stays diffable on purpose: Cargo.toml holds only semver ranges,
+# so the lockfile is the one place a resolved dependency bump shows up.
+Cargo.lock text eol=lf
