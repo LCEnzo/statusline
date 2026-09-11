@@ -9,3 +9,25 @@ Cargo.toml text eol=lf
 # Cargo.lock stays diffable on purpose: Cargo.toml holds only semver ranges,
 # so the lockfile is the one place a resolved dependency bump shows up.
 Cargo.lock text eol=lf
+
+# Redundant under the baseline, and kept deliberately: in a shell script CRLF
+# is fatal rather than untidy ("$'\r': command not found", "bad interpreter").
+# If the baseline is ever loosened, this must not loosen with it.
+*.sh text eol=lf
+
+# Windows-only scripts keep CRLF. cmd.exe can miss goto/call labels in an
+# LF-only batch file; PowerShell reads LF fine, and .ps1 follows the Windows
+# convention.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binaries, such as a README screenshot. text=auto already detects most of
+# them; `binary` makes it unconditional: no line-ending conversion, no text
+# diff, no text merge.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.exe binary
