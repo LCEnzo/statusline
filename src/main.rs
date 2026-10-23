@@ -18,6 +18,12 @@ const MAGENTA: &str = "\x1b[35m";
 const DIM_BLUE: &str = "\x1b[2;34m";
 const DIM_CYAN: &str = "\x1b[2;36m";
 const ORANGE: &str = "\x1b[38;5;208m";
+// Reasoning effort, red (fast) to gold (max); no step is the model's ORANGE.
+const EFFORT_LOW: &str = "\x1b[38;5;196m";
+const EFFORT_MEDIUM: &str = "\x1b[38;5;202m";
+const EFFORT_HIGH: &str = "\x1b[38;5;136m";
+const EFFORT_XHIGH: &str = "\x1b[38;5;178m";
+const EFFORT_MAX: &str = "\x1b[1;38;5;220m";
 
 /// A statusline segment: ANSI text plus its visible (printable) width.
 #[derive(Default)]
@@ -53,6 +59,18 @@ fn get_f64(v: &Value, path: &[&str]) -> Option<f64> {
         cur = cur.get(k)?;
     }
     cur.as_f64()
+}
+
+fn effort_color(level: &str) -> &'static str {
+    match level {
+        "low" => EFFORT_LOW,
+        "medium" => EFFORT_MEDIUM,
+        "high" => EFFORT_HIGH,
+        "xhigh" => EFFORT_XHIGH,
+        "max" => EFFORT_MAX,
+        // A level newer than this build still shows, uncoloured.
+        _ => DIM,
+    }
 }
 
 fn usage_color(pct: i64) -> &'static str {
@@ -343,6 +361,8 @@ fn main() {
 
     let display_name = get_str(&v, &["model", "display_name"]).unwrap_or("Claude");
     let model_id = get_str(&v, &["model", "id"]).unwrap_or("");
+    // Absent when the model takes no effort parameter.
+    let effort = get_str(&v, &["effort", "level"]);
     let cwd: PathBuf = get_str(&v, &["workspace", "current_dir"])
         .or_else(|| get_str(&v, &["cwd"]))
         .map(PathBuf::from)
@@ -350,7 +370,8 @@ fn main() {
         .unwrap_or_default();
     let project_dir = get_str(&v, &["workspace", "project_dir"]).unwrap_or("");
 
-    // Model: full variant carries the id, short variant is the trim fallback.
+    // Model: full variant carries the id, short variant is the trim fallback. The effort
+    // level rides on both, so trimming the id for width never hides it.
     let mut model_full = Seg::default();
     let mut model_short = Seg::default();
     model_short.push(ORANGE, display_name);
@@ -358,6 +379,12 @@ fn main() {
         model_full.push(ORANGE, display_name);
     } else {
         model_full.push(ORANGE, &format!("{display_name} [{model_id}]"));
+    }
+    if let Some(level) = effort {
+        for seg in [&mut model_full, &mut model_short] {
+            seg.push("", " ");
+            seg.push(effort_color(level), level);
+        }
     }
 
     // Location: project name + relative path when inside a project subdir.
