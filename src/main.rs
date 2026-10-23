@@ -1,11 +1,13 @@
 // Claude Code statusline. Receives session JSON on stdin, prints one
 // ANSI-colored line on stdout. Reads .git directly where possible so a
 // refresh costs at most two git subprocesses (status; diffstat when dirty).
+// With --navigator it appends `navigator statusline`'s segment, the join
+// contrib/nav-wrapper.sh in the navigator repo does from bash.
 
 use serde_json::Value;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -509,11 +511,12 @@ fn main() {
         let width: usize = segs.iter().map(|s| s.width).sum::<usize>() + 3 * (segs.len() - 1);
         if width <= budget || (!full_model && !with_cost) {
             let sep = format!(" {DIM}\u{2022}{RESET} ");
-            break segs
+            let text = segs
                 .iter()
                 .map(|s| s.text.as_str())
                 .collect::<Vec<_>>()
                 .join(&sep);
+            break (text, width);
         }
         if full_model {
             full_model = false;
@@ -522,5 +525,110 @@ fn main() {
         }
     };
 
-    println!("{line}");
+    let (line, line_width) = line;
+    let nav = if std::env::args().skip(1).any(|a| a == "--navigator") {
+        let width =
+            columns(std::env::var("COLUMNS").ok().as_deref()).map(|c| nav_width(c, line_width));
+        navigator_segment(&input, width).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    println!("{}", join(&line, &nav));
+}
+
+/// The row width from COLUMNS, if it is a plain positive decimal of at most five digits.
+/// Anything else means unknown, as in contrib/nav-wrapper.sh.
+fn columns(raw: Option<&str>) -> Option<i64> {
+    let raw = raw?;
+    let plain = !raw.is_empty() && raw.len() <= 5 && raw.bytes().all(|b| b.is_ascii_digit());
+    if !plain || raw.starts_with('0') {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// Columns left for the navigator segment after the base and the two-space gap. Navigator
+/// prints nothing for zero or less, so it is passed on as is.
+fn nav_width(columns: i64, base_width: usize) -> i64 {
+    columns - base_width as i64 - 2
+}
+
+fn join(base: &str, nav: &str) -> String {
+    let nav = nav.trim_end_matches(['\r', '\n']);
+    if nav.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}  {nav}")
+    }
+}
+
+/// `navigator statusline`'s segment for this payload, or None if navigator can't start.
+/// Spawned directly rather than from a shell: MSYS2 bash starts native children
+/// suspended, and Claude Code's tree kill landing in that window strands them suspended.
+fn navigator_segment(input: &str, width: Option<i64>) -> Option<String> {
+    let bin = std::env::var_os("NAVIGATOR_BIN")
+        .filter(|b| !b.is_empty())
+        .unwrap_or_else(|| "navigator".into());
+    let mut cmd = Command::new(bin);
+    // Navigator sees a pipe and would print uncoloured; 256 matches the base's 38;5 colours.
+    cmd.args(["statusline", "--color", "256"]);
+    if let Some(w) = width {
+        cmd.arg("--width").arg(w.to_string());
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    // Fed from a thread so a navigator that writes before it finishes reading can't deadlock.
+    let out = std::thread::scope(|s| {
+        s.spawn(move || stdin.write_all(input.as_bytes()));
+        child.wait_with_output()
+    })
+    .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn columns_accepts_plain_positive_decimals_below_six_digits() {
+        assert_eq!(columns(Some("1")), Some(1));
+        assert_eq!(columns(Some("80")), Some(80));
+        assert_eq!(columns(Some("99999")), Some(99999));
+    }
+
+    #[test]
+    fn columns_refuses_what_nav_wrapper_refuses() {
+        for raw in [
+            "", "0", "08", "0100", "100000", "auto", "-5", "+80", " 80", "80 ", "8 0",
+        ] {
+            assert_eq!(columns(Some(raw)), None, "{raw:?}");
+        }
+        assert_eq!(columns(None), None);
+    }
+
+    #[test]
+    fn nav_width_leaves_the_two_column_gap_and_may_go_negative() {
+        assert_eq!(nav_width(120, 70), 48);
+        assert_eq!(nav_width(72, 70), 0);
+        assert_eq!(nav_width(60, 70), -12);
+    }
+
+    #[test]
+    fn join_puts_two_spaces_between_halves() {
+        assert_eq!(join("base", "nav"), "base  nav");
+    }
+
+    #[test]
+    fn join_drops_trailing_line_ends_and_an_empty_nav() {
+        assert_eq!(join("base", "nav\r\n"), "base  nav");
+        assert_eq!(join("base", "nav\n\n"), "base  nav");
+        assert_eq!(join("base", ""), "base");
+        assert_eq!(join("base", "\r\n"), "base");
+    }
 }
