@@ -45,8 +45,12 @@ fn payload() -> String {
 
 /// Runs the statusline and returns its stdout; `envs` of None removes the variable.
 fn run(args: &[&str], envs: &[(&str, Option<&str>)], input: &str) -> String {
+    // No login and a cache of its own: the usage fetch must not reach the network from a test.
+    let no_login = Path::new(env!("CARGO_TARGET_TMPDIR")).join("navigator-no-login");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_statusline"));
     cmd.args(args)
+        .env("CLAUDE_CONFIG_DIR", &no_login)
+        .env("STATUSLINE_CACHE_DIR", &no_login)
         .env_remove("NAVIGATOR_BIN")
         .env_remove("COLUMNS")
         .env_remove("FAKE_NAV_OUT")

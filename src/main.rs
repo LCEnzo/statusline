@@ -2,8 +2,12 @@
 // ANSI-colored line on stdout. Reads .git directly where possible so a
 // refresh costs at most two git subprocesses (status; diffstat when dirty).
 // With --navigator it appends `navigator statusline`'s segment, the join
-// contrib/nav-wrapper.sh in the navigator repo does from bash.
+// contrib/nav-wrapper.sh in the navigator repo does from bash. Usage windows stdin lacks
+// (Fable's weekly one) come from claude.ai's usage endpoint through usage.rs's cache.
 
+mod usage;
+
+use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -319,29 +323,84 @@ fn term_width() -> Option<usize> {
 }
 
 fn pct_seg(v: &Value, path: &[&str], label: &str) -> Option<Seg> {
-    let pct = get_f64(v, path)?.round() as i64;
-    let mut seg = Seg::default();
-    seg.push(usage_color(pct), &format!("{label} {pct}%"));
-    Some(seg)
+    Some(pct_seg_of(label, get_f64(v, path)?))
 }
 
-/// Rate-limit segment: colored percentage plus a dim time-to-reset.
-/// The 5h window (and a weekly reset landing today) shows hours/minutes;
-/// a weekly reset on another day shows the weekday.
-fn limit_seg(v: &Value, bucket: &str, label: &str, weekly: bool) -> Option<Seg> {
-    let mut seg = pct_seg(v, &["rate_limits", bucket, "used_percentage"], label)?;
-    let reset = get_f64(v, &["rate_limits", bucket, "resets_at"]);
-    if let Some(ann) = reset.and_then(|r| reset_annotation(r as i64, weekly)) {
+fn pct_seg_of(label: &str, pct: f64) -> Seg {
+    let pct = pct.round() as i64;
+    let mut seg = Seg::default();
+    seg.push(usage_color(pct), &format!("{label} {pct}%"));
+    seg
+}
+
+/// Rate-limit segment: colored percentage, a dim `?` when the number could not be refreshed,
+/// and a dim time-to-reset. The 5h window (and a weekly reset landing today) shows
+/// hours/minutes; a weekly reset on another day shows the weekday.
+fn limit_seg(
+    label: &str,
+    pct: f64,
+    resets_at: Option<i64>,
+    weekly: bool,
+    stale: bool,
+    now: DateTime<Local>,
+) -> Seg {
+    let mut seg = pct_seg_of(label, pct);
+    if stale {
+        seg.push(DIM, "?");
+    }
+    if let Some(ann) = resets_at.and_then(|r| reset_annotation(r, weekly, now)) {
         seg.push("", " ");
         seg.push(DIM, &format!("({ann})"));
     }
-    Some(seg)
+    seg
 }
 
-fn reset_annotation(resets_at: i64, weekly: bool) -> Option<String> {
-    use chrono::{DateTime, Local};
+/// The limit segments: 5h and W from stdin, which is fresher, else from the cache; then every
+/// other cached window (Fable), which stdin never carries. A cached window whose reset has
+/// passed is left out, since its number belongs to a window that has ended.
+fn usage_segs(v: &Value, cache: Option<&usage::Cache>, now: DateTime<Local>) -> Vec<Seg> {
+    let windows = cache.map(|c| c.windows.as_slice()).unwrap_or_default();
+    let stale = cache.is_some_and(|c| c.stale);
+    let cached = |w: &usage::Window, label: &str| {
+        let resets_at = w.resets_at.map(|t| t.timestamp());
+        if resets_at.is_some_and(|r| r <= now.timestamp()) {
+            return None;
+        }
+        let weekly = w.window_seconds > 86_400;
+        Some(limit_seg(
+            label,
+            w.used_percent,
+            resets_at,
+            weekly,
+            stale,
+            now,
+        ))
+    };
+    let mut segs = Vec::new();
+    for (bucket, name, label, weekly) in [
+        ("five_hour", usage::FIVE_HOUR, "5h", false),
+        ("seven_day", usage::WEEKLY, "W", true),
+    ] {
+        let from_stdin = get_f64(v, &["rate_limits", bucket, "used_percentage"]).map(|pct| {
+            let reset = get_f64(v, &["rate_limits", bucket, "resets_at"]).map(|r| r as i64);
+            limit_seg(label, pct, reset, weekly, false, now)
+        });
+        let seg = from_stdin.or_else(|| {
+            let w = windows.iter().find(|w| w.name == name)?;
+            cached(w, label)
+        });
+        segs.extend(seg);
+    }
+    for w in windows {
+        if w.name != usage::FIVE_HOUR && w.name != usage::WEEKLY {
+            segs.extend(cached(w, &w.name));
+        }
+    }
+    segs
+}
+
+fn reset_annotation(resets_at: i64, weekly: bool, now: DateTime<Local>) -> Option<String> {
     let reset: DateTime<Local> = DateTime::from_timestamp(resets_at, 0)?.with_timezone(&Local);
-    let now = Local::now();
     let mins = (reset - now).num_minutes();
     if mins <= 0 {
         return None;
@@ -360,6 +419,8 @@ fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).ok();
     let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
+    // A due fetch runs while git does; the bar waits for it only so long.
+    let usage = usage::Usage::start(Utc::now());
 
     let display_name = get_str(&v, &["model", "display_name"]).unwrap_or("Claude");
     let model_id = get_str(&v, &["model", "id"]).unwrap_or("");
@@ -470,8 +531,7 @@ fn main() {
     // would be the most useful next addition, though it overlaps with the
     // branch/worktree info already shown.
     let ctx_seg = pct_seg(&v, &["context_window", "used_percentage"], "Context");
-    let five_seg = limit_seg(&v, "five_hour", "5h", false);
-    let week_seg = limit_seg(&v, "seven_day", "W", true);
+    let limit_segs = usage_segs(&v, usage.finish().as_ref(), Local::now());
 
     let cost_seg = get_f64(&v, &["cost", "total_cost_usd"]).map(|c| {
         let mut seg = Seg::default();
@@ -494,11 +554,7 @@ fn main() {
         let mut segs: Vec<&Seg> = Vec::new();
         segs.push(if full_model { &model_full } else { &model_short });
         segs.push(&loc);
-        for opt in [&git_seg, &ctx_seg, &five_seg, &week_seg] {
-            if let Some(s) = opt {
-                segs.push(s);
-            }
-        }
+        segs.extend(git_seg.iter().chain(&ctx_seg).chain(&limit_segs));
         if with_cost {
             if let Some(s) = &cost_seg {
                 segs.push(s);
@@ -622,6 +678,162 @@ mod tests {
     #[test]
     fn join_puts_two_spaces_between_halves() {
         assert_eq!(join("base", "nav"), "base  nav");
+    }
+
+    use chrono::{TimeDelta, TimeZone};
+
+    /// Monday 23.11.2026 10:00 local time, clear of any daylight-saving change.
+    fn monday_ten() -> DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 11, 23, 10, 0, 0).unwrap()
+    }
+
+    fn visible(seg: &Seg) -> String {
+        let mut out = String::new();
+        let mut chars = seg.text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                chars.by_ref().find(|&c| c == 'm');
+            } else {
+                out.push(c);
+            }
+        }
+        assert_eq!(out.chars().count(), seg.width, "width of {out:?}");
+        out
+    }
+
+    #[test]
+    fn reset_annotation_rounds_hours_up_and_names_another_day_for_weekly() {
+        let now = monday_ten();
+        let ann =
+            |after: TimeDelta, weekly| reset_annotation((now + after).timestamp(), weekly, now);
+        assert_eq!(ann(TimeDelta::seconds(0), false), None);
+        assert_eq!(ann(TimeDelta::seconds(-60), false), None);
+        assert_eq!(ann(TimeDelta::seconds(59), false), None);
+        assert_eq!(ann(TimeDelta::seconds(60), false).as_deref(), Some("1m"));
+        assert_eq!(ann(TimeDelta::minutes(59), false).as_deref(), Some("59m"));
+        assert_eq!(ann(TimeDelta::minutes(60), false).as_deref(), Some("1h"));
+        assert_eq!(ann(TimeDelta::minutes(61), false).as_deref(), Some("2h"));
+        // Monday 23:59 is today; Tuesday 00:00 is not.
+        let to_midnight = TimeDelta::hours(14);
+        assert_eq!(
+            ann(to_midnight - TimeDelta::minutes(1), true).as_deref(),
+            Some("14h")
+        );
+        assert_eq!(ann(to_midnight, true).as_deref(), Some("Tue"));
+        assert_eq!(ann(to_midnight, false).as_deref(), Some("14h"));
+    }
+
+    fn cache(stale: bool, windows: Vec<usage::Window>) -> usage::Cache {
+        usage::Cache {
+            fetched_at: Some(Utc::now()),
+            stale,
+            error: None,
+            windows,
+        }
+    }
+
+    fn window(name: &str, pct: f64, resets_at: DateTime<Local>, secs: i64) -> usage::Window {
+        usage::Window {
+            name: name.into(),
+            used_percent: pct,
+            resets_at: Some(resets_at.with_timezone(&Utc)),
+            window_seconds: secs,
+        }
+    }
+
+    fn texts(v: &Value, cache: Option<&usage::Cache>, now: DateTime<Local>) -> Vec<String> {
+        usage_segs(v, cache, now).iter().map(visible).collect()
+    }
+
+    /// Friday 27.11.2026 18:59:59 local, the weekly reset of the endpoint's real answer.
+    fn friday_reset() -> DateTime<Local> {
+        Local.with_ymd_and_hms(2026, 11, 27, 18, 59, 59).unwrap()
+    }
+
+    #[test]
+    fn fable_sits_beside_the_weekly_window_which_stdin_supplies() {
+        let now = monday_ten();
+        let stdin = serde_json::json!({"rate_limits": {"seven_day": {
+            "used_percentage": 43.4, "resets_at": friday_reset().timestamp()}}});
+        let c = cache(
+            false,
+            vec![
+                window(usage::WEEKLY, 41.0, friday_reset(), 604_800),
+                window("Fable", 32.0, friday_reset(), 604_800),
+            ],
+        );
+        assert_eq!(
+            texts(&stdin, Some(&c), now),
+            ["W 43% (Fri)", "Fable 32% (Fri)"]
+        );
+    }
+
+    #[test]
+    fn the_cache_fills_the_windows_stdin_lacks() {
+        let now = monday_ten();
+        let c = cache(
+            false,
+            vec![
+                window(
+                    usage::FIVE_HOUR,
+                    12.0,
+                    now + TimeDelta::minutes(150),
+                    18_000,
+                ),
+                window(usage::WEEKLY, 41.0, friday_reset(), 604_800),
+                window("Fable", 32.0, friday_reset(), 604_800),
+            ],
+        );
+        let no_limits = serde_json::json!({"model": {"id": "claude-opus-5-5"}});
+        assert_eq!(
+            texts(&no_limits, Some(&c), now),
+            ["5h 12% (3h)", "W 41% (Fri)", "Fable 32% (Fri)"]
+        );
+    }
+
+    #[test]
+    fn a_stale_cache_marks_its_numbers_and_stdin_ones_stay_unmarked() {
+        let now = monday_ten();
+        let stdin = serde_json::json!({"rate_limits": {"seven_day": {"used_percentage": 43}}});
+        let c = cache(true, vec![window("Fable", 32.0, friday_reset(), 604_800)]);
+        assert_eq!(texts(&stdin, Some(&c), now), ["W 43%", "Fable 32%? (Fri)"]);
+    }
+
+    #[test]
+    fn a_cached_window_whose_reset_has_passed_is_left_out() {
+        let now = monday_ten();
+        let c = |after: TimeDelta| cache(false, vec![window("Fable", 32.0, now + after, 604_800)]);
+        let none = Value::Null;
+        assert_eq!(
+            texts(&none, Some(&c(TimeDelta::seconds(-1))), now),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            texts(&none, Some(&c(TimeDelta::seconds(0))), now),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            texts(&none, Some(&c(TimeDelta::seconds(90))), now),
+            ["Fable 32% (1m)"]
+        );
+        let no_reset = cache(
+            false,
+            vec![usage::Window {
+                resets_at: None,
+                ..window("Fable", 32.0, now, 604_800)
+            }],
+        );
+        assert_eq!(texts(&none, Some(&no_reset), now), ["Fable 32%"]);
+    }
+
+    #[test]
+    fn without_a_cache_the_limits_come_from_stdin_alone() {
+        let now = monday_ten();
+        let stdin = serde_json::json!({"rate_limits": {
+            "five_hour": {"used_percentage": 95, "resets_at": (now + TimeDelta::minutes(30)).timestamp()},
+            "seven_day": {"used_percentage": 50}}});
+        assert_eq!(texts(&stdin, None, now), ["5h 95% (30m)", "W 50%"]);
+        assert_eq!(texts(&Value::Null, None, now), Vec::<String>::new());
     }
 
     #[test]
