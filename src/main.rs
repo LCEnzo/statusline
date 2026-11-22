@@ -3,11 +3,11 @@
 // refresh costs at most two git subprocesses (status; diffstat when dirty).
 // With --navigator it appends `navigator statusline`'s segment, the join
 // contrib/nav-wrapper.sh in the navigator repo does from bash. Usage windows stdin lacks
-// (Fable's weekly one) come from claude.ai's usage endpoint through usage.rs's cache.
+// (Fable's weekly one) come from the file the usage-relay mod writes; see usage.rs.
 
 mod usage;
 
-use chrono::{DateTime, Local, Utc};
+use chrono::{DateTime, Local};
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -355,26 +355,26 @@ fn limit_seg(
     seg
 }
 
-/// The limit segments: 5h and W from stdin, which is fresher, else from the cache; then every
-/// other cached window (Fable), which stdin never carries. A cached window whose reset has
-/// passed is left out, since its number belongs to a window that has ended.
+/// A model's weekly window: the model's initial and the number, with a dim `?` when the relay's
+/// last refresh failed. No reset annotation: it resets with the weekly one.
+fn model_seg(name: &str, pct: f64, stale: bool) -> Seg {
+    let initial: String = name.chars().take(1).flat_map(char::to_uppercase).collect();
+    let mut seg = pct_seg_of(&initial, pct);
+    if stale {
+        seg.push(DIM, "?");
+    }
+    seg
+}
+
+/// The limit segments: 5h and W from stdin, which is fresher, else from the relay's file; then
+/// every other window in the file (Fable), which stdin never carries. A file window whose reset
+/// has passed is left out, since its number belongs to a window that has ended.
 fn usage_segs(v: &Value, cache: Option<&usage::Cache>, now: DateTime<Local>) -> Vec<Seg> {
     let windows = cache.map(|c| c.windows.as_slice()).unwrap_or_default();
     let stale = cache.is_some_and(|c| c.stale);
-    let cached = |w: &usage::Window, label: &str| {
-        let resets_at = w.resets_at.map(|t| t.timestamp());
-        if resets_at.is_some_and(|r| r <= now.timestamp()) {
-            return None;
-        }
-        let weekly = w.window_seconds > 86_400;
-        Some(limit_seg(
-            label,
-            w.used_percent,
-            resets_at,
-            weekly,
-            stale,
-            now,
-        ))
+    let live = |w: &usage::Window| {
+        w.resets_at
+            .is_none_or(|r| r.timestamp() > now.timestamp())
     };
     let mut segs = Vec::new();
     for (bucket, name, label, weekly) in [
@@ -386,14 +386,15 @@ fn usage_segs(v: &Value, cache: Option<&usage::Cache>, now: DateTime<Local>) -> 
             limit_seg(label, pct, reset, weekly, false, now)
         });
         let seg = from_stdin.or_else(|| {
-            let w = windows.iter().find(|w| w.name == name)?;
-            cached(w, label)
+            let w = windows.iter().find(|w| w.name == name && live(w))?;
+            let reset = w.resets_at.map(|t| t.timestamp());
+            Some(limit_seg(label, w.used_percent, reset, weekly, stale, now))
         });
         segs.extend(seg);
     }
     for w in windows {
-        if w.name != usage::FIVE_HOUR && w.name != usage::WEEKLY {
-            segs.extend(cached(w, &w.name));
+        if w.name != usage::FIVE_HOUR && w.name != usage::WEEKLY && live(w) {
+            segs.push(model_seg(&w.name, w.used_percent, stale));
         }
     }
     segs
@@ -419,8 +420,6 @@ fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).ok();
     let v: Value = serde_json::from_str(&input).unwrap_or(Value::Null);
-    // A due fetch runs while git does; the bar waits for it only so long.
-    let usage = usage::Usage::start(Utc::now());
 
     let display_name = get_str(&v, &["model", "display_name"]).unwrap_or("Claude");
     let model_id = get_str(&v, &["model", "id"]).unwrap_or("");
@@ -531,7 +530,7 @@ fn main() {
     // would be the most useful next addition, though it overlaps with the
     // branch/worktree info already shown.
     let ctx_seg = pct_seg(&v, &["context_window", "used_percentage"], "Context");
-    let limit_segs = usage_segs(&v, usage.finish().as_ref(), Local::now());
+    let limit_segs = usage_segs(&v, usage::load().as_ref(), Local::now());
 
     let cost_seg = get_f64(&v, &["cost", "total_cost_usd"]).map(|c| {
         let mut seg = Seg::default();
@@ -724,19 +723,14 @@ mod tests {
     }
 
     fn cache(stale: bool, windows: Vec<usage::Window>) -> usage::Cache {
-        usage::Cache {
-            fetched_at: Some(Utc::now()),
-            stale,
-            error: None,
-            windows,
-        }
+        usage::Cache { stale, windows }
     }
 
     fn window(name: &str, pct: f64, resets_at: DateTime<Local>, secs: i64) -> usage::Window {
         usage::Window {
             name: name.into(),
             used_percent: pct,
-            resets_at: Some(resets_at.with_timezone(&Utc)),
+            resets_at: Some(resets_at.with_timezone(&chrono::Utc)),
             window_seconds: secs,
         }
     }
@@ -764,7 +758,7 @@ mod tests {
         );
         assert_eq!(
             texts(&stdin, Some(&c), now),
-            ["W 43% (Fri)", "Fable 32% (Fri)"]
+            ["W 43% (Fri)", "F 32%"]
         );
     }
 
@@ -787,7 +781,7 @@ mod tests {
         let no_limits = serde_json::json!({"model": {"id": "claude-opus-5-5"}});
         assert_eq!(
             texts(&no_limits, Some(&c), now),
-            ["5h 12% (3h)", "W 41% (Fri)", "Fable 32% (Fri)"]
+            ["5h 12% (3h)", "W 41% (Fri)", "F 32%"]
         );
     }
 
@@ -796,7 +790,7 @@ mod tests {
         let now = monday_ten();
         let stdin = serde_json::json!({"rate_limits": {"seven_day": {"used_percentage": 43}}});
         let c = cache(true, vec![window("Fable", 32.0, friday_reset(), 604_800)]);
-        assert_eq!(texts(&stdin, Some(&c), now), ["W 43%", "Fable 32%? (Fri)"]);
+        assert_eq!(texts(&stdin, Some(&c), now), ["W 43%", "F 32%?"]);
     }
 
     #[test]
@@ -813,8 +807,12 @@ mod tests {
             Vec::<String>::new()
         );
         assert_eq!(
+            texts(&none, Some(&c(TimeDelta::seconds(1))), now),
+            ["F 32%"]
+        );
+        assert_eq!(
             texts(&none, Some(&c(TimeDelta::seconds(90))), now),
-            ["Fable 32% (1m)"]
+            ["F 32%"]
         );
         let no_reset = cache(
             false,
@@ -823,7 +821,52 @@ mod tests {
                 ..window("Fable", 32.0, now, 604_800)
             }],
         );
-        assert_eq!(texts(&none, Some(&no_reset), now), ["Fable 32%"]);
+        assert_eq!(texts(&none, Some(&no_reset), now), ["F 32%"]);
+    }
+
+    #[test]
+    fn a_passed_reset_also_hides_a_file_window_standing_in_for_stdin() {
+        let now = monday_ten();
+        let c = |after: TimeDelta| {
+            cache(
+                false,
+                vec![window(usage::WEEKLY, 41.0, now + after, 604_800)],
+            )
+        };
+        let none = Value::Null;
+        assert_eq!(
+            texts(&none, Some(&c(TimeDelta::seconds(0))), now),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            texts(&none, Some(&c(TimeDelta::hours(2))), now),
+            ["W 41% (2h)"]
+        );
+    }
+
+    #[test]
+    fn the_fable_mark_follows_the_stale_flag_and_takes_the_weekly_colour() {
+        let now = monday_ten();
+        let one = |stale, pct| {
+            let c = cache(stale, vec![window("Fable", pct, friday_reset(), 604_800)]);
+            usage_segs(&Value::Null, Some(&c), now)
+        };
+        assert_eq!(one(false, 32.0).iter().map(visible).collect::<Vec<_>>(), ["F 32%"]);
+        assert_eq!(one(true, 32.0).iter().map(visible).collect::<Vec<_>>(), ["F 32%?"]);
+        // The colour steps at 50, 80 and 90, as W's does.
+        for (pct, colour) in [
+            (49.4, GREEN),
+            (49.5, CYAN),
+            (79.4, CYAN),
+            (79.5, RED),
+            (89.4, RED),
+            (89.5, BOLD_RED),
+        ] {
+            let f = &one(false, pct)[0];
+            assert!(f.text.starts_with(colour), "colour at {pct}: {:?}", f.text);
+            assert_eq!(f.text, pct_seg_of("F", pct).text, "same as the W recipe at {pct}");
+        }
+        assert!(one(true, 32.0)[0].text.ends_with(&format!("{DIM}?{RESET}")));
     }
 
     #[test]
